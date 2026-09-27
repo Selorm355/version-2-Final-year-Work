@@ -1,0 +1,16 @@
+# Python Virtual Environment
+venv/
+env/
+
+# OmniPulse Analytics Local Storage
+temp_data/
+*.parquet
+
+# Python Cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS Files
+.DS_Store
+Thumbs.db
