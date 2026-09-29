@@ -15,6 +15,7 @@ from src.display_formatting import (
     format_numeric_value,
     is_monetary_column,
 )
+from src.sales_analytics import summarize_sales
 
 SLATE_GRAY = "#2F4F4F"
 TEAL = "#008080"
@@ -138,7 +139,7 @@ Rules:
     - Dead stock: only identify zero/slow-selling products when the dataset includes a product universe or inventory snapshot and a usable date/window. Transaction-only data cannot prove unsold stock; explain the limitation.
     - Data health: report detectable nulls, duplicate rows, and negative values using available cleaned data. The uploaded file is cleaned before chat: text nulls may have become UNKNOWN and negative numeric values may have been made absolute, so do not claim to detect original-file issues that are no longer represented.
     - Numeric profiling: for requested numeric columns, provide count, mean, median, min, max, standard deviation, and quartiles using DuckDB aggregates/quantiles.
-    - Executive summaries: answer with concise evidence-based bullets from query results; do not invent findings or claim a computation not present in the result.
+    - Executive summaries: answer with evidence-based bullets across every supplied overview section, including dataset size, numeric measures, category leaders, dates, sales/profit, and data quality. Call out missing/unavailable measures. Do not invent findings or claim a computation not present in the result.
     - If required columns are missing, say exactly what is unavailable and ask for the needed column rather than fabricating a result.
 3. DuckDB SQL Rules:
    - FROM clause MUST be: FROM '{parquet_path}'
@@ -172,7 +173,7 @@ st.caption("Ask about trends, period growth, AOV, repeat customers, basket pairs
 st.markdown("**Try an analysis**")
 suggestion_columns = st.columns(3)
 suggested_questions = [
-    "Show revenue by product as a pie chart",
+    "Give me an executive overview of the data",
     "Plot monthly revenue trends",
     "Which products sold the most?",
 ]
@@ -226,7 +227,7 @@ def run_query_with_retry(client, initial_sql, prompt, system_prompt, conversatio
 
 
 def summarize_query_results(client, prompt, result_df):
-    preview_limit = 100
+    preview_limit = 250
     result_preview = result_df.head(preview_limit).to_json(orient="records", date_format="iso")
     truncated_note = (
         f"The result contains {len(result_df)} rows; only the first {preview_limit} are shown below. "
@@ -258,6 +259,196 @@ def summarize_query_results(client, prompt, result_df):
         temperature=0.0,
     )
     return response.choices[0].message.content.strip()
+
+
+def is_executive_overview_request(prompt):
+    return bool(re.search(
+        r"\b(executive overview|executive summary|full overview|dataset overview|"
+        r"high[- ]level overview|overview of (the )?(dataset|data|business)|"
+        r"summari[sz]e (the )?(dataset|data|business)|"
+        r"key insights|all insights|more insights|insights from (the )?(dataset|data))\b",
+        prompt,
+        re.IGNORECASE,
+    ))
+
+
+def format_executive_overview_message(overview_df):
+    """Turn the evidence table into bullets without another LLM call."""
+    def find_row(section, insight_hint):
+        matches = overview_df[
+            (overview_df["Section"] == section)
+            & (overview_df["Insight"].str.contains(insight_hint, case=False, na=False))
+        ]
+        if matches.empty:
+            return None
+        row = matches.iloc[0]
+        return row["Insight"], row["Value"]
+
+    bullet_specs = [
+        ("Dataset", "Total records"),
+        ("Sales performance", "Total revenue"),
+        ("Sales performance", "Total profit"),
+        ("Sales performance", "Total units sold"),
+        ("Sales performance", "Distinct orders"),
+        ("Sales performance", "Average order value"),
+        ("Product performance", "Top products"),
+        ("Product performance", "Least performing product"),
+        ("Product performance", "Most units sold"),
+        ("Date range", "earliest"),
+        ("Date range", "latest"),
+        ("Data quality", "Duplicate"),
+    ]
+    bullets = []
+    for section, hint in bullet_specs:
+        match = find_row(section, hint)
+        if match:
+            bullets.append(f"- **{match[0]}:** {match[1]}")
+
+    if not bullets:
+        for _, row in overview_df.head(8).iterrows():
+            bullets.append(f"- **{row['Insight']}:** {row['Value']}")
+
+    return "**Executive overview**\n\n" + "\n".join(bullets)
+
+
+def build_dataset_overview(parquet_path, profile):
+    """Create a broad evidence table from the full cleaned dataset."""
+    dataset = pd.read_parquet(parquet_path)
+    overview_rows = []
+
+    def add_overview(section, insight, value):
+        overview_rows.append({"Section": section, "Insight": insight, "Value": str(value)})
+
+    add_overview("Dataset", "Total records", f"{len(dataset):,}")
+    add_overview("Dataset", "Total columns", f"{len(dataset.columns):,}")
+    add_overview("Data quality", "Duplicate rows in cleaned data", f"{int(dataset.duplicated().sum()):,}")
+    for column, missing_count in dataset.isna().sum().items():
+        if missing_count:
+            add_overview("Data quality", f"{column}: remaining missing values", f"{missing_count:,}")
+
+    def format_statistic(value, column):
+        if is_monetary_column(column):
+            return format_numeric_value(value, column)
+        return f"{value:,.2f}"
+
+    for column in profile.get("Metrics", []):
+        values = pd.to_numeric(dataset[column], errors="coerce").dropna()
+        if values.empty:
+            continue
+        statistics = (
+            ("Valid values", f"{len(values):,}"),
+            ("Mean", format_statistic(values.mean(), column)),
+            ("Median", format_statistic(values.median(), column)),
+            ("Minimum", format_statistic(values.min(), column)),
+            ("25th percentile", format_statistic(values.quantile(0.25), column)),
+            ("75th percentile", format_statistic(values.quantile(0.75), column)),
+            ("Maximum", format_statistic(values.max(), column)),
+            ("Standard deviation", format_statistic(values.std(), column)),
+        )
+        for statistic, value in statistics:
+            add_overview("Numeric profile", f"{column}: {statistic}", value)
+
+    for column in profile.get("Dimensions", []):
+        values = dataset[column].dropna().astype(str)
+        if values.empty:
+            continue
+        counts = values.value_counts()
+        add_overview("Category profile", f"{column}: distinct values", f"{values.nunique():,}")
+        add_overview(
+            "Category profile",
+            f"{column}: most common value",
+            f"{counts.index[0]} ({counts.iloc[0]:,} rows)",
+        )
+
+    for column in dataset.columns:
+        if not re.search(r"date|time|timestamp", str(column), re.IGNORECASE):
+            continue
+        parsed_dates = pd.to_datetime(dataset[column], errors="coerce").dropna()
+        if not parsed_dates.empty:
+            add_overview("Date range", f"{column}: earliest date", parsed_dates.min().strftime("%Y-%m-%d"))
+            add_overview("Date range", f"{column}: latest date", parsed_dates.max().strftime("%Y-%m-%d"))
+
+    def find_column(columns, hints, excluded=()):
+        for hint in hints:
+            for column in columns:
+                normalized = str(column).lower().replace("_", " ").replace("-", " ")
+                if hint in normalized and not any(term in normalized for term in excluded):
+                    return column
+        return None
+
+    numeric_columns = profile.get("Metrics", [])
+    product_column = find_column(profile.get("Dimensions", []), ("product", "item", "sku", "article"))
+    quantity_column = find_column(
+        numeric_columns,
+        ("quantity sold", "units sold", "items sold", "qty", "quantity", "units"),
+        ("price", "amount", "revenue", "sales", "cost", "discount", "profit"),
+    )
+    revenue_column = find_column(
+        numeric_columns,
+        ("revenue", "turnover", "sales", "total amount", "amount"),
+        ("discount", "cost", "profit", "quantity", "qty", "unit", "count", "percent"),
+    )
+    unit_price_column = find_column(numeric_columns, ("unit price", "selling price", "sale price", "price per unit", "price"))
+    total_cost_column = find_column(
+        numeric_columns,
+        ("total cost", "cost total", "total cogs", "cost amount", "cost of goods"),
+        ("unit", "per unit", "quantity"),
+    )
+    unit_cost_column = find_column(numeric_columns, ("unit cost", "cost per unit", "purchase price", "cost price"))
+    order_column = find_column(dataset.columns, ("order id", "order number", "invoice", "transaction id", "receipt"))
+
+    analysis_columns = list(dict.fromkeys(
+        column for column in (
+            product_column, quantity_column, revenue_column, unit_price_column,
+            total_cost_column, unit_cost_column,
+        ) if column
+    ))
+    if analysis_columns:
+        product_summary, totals = summarize_sales(
+            dataset[analysis_columns],
+            product_column=product_column,
+            quantity_column=quantity_column,
+            sales_column=revenue_column,
+            unit_price_column=unit_price_column if revenue_column is None else None,
+            cost_column=total_cost_column,
+            unit_cost_column=unit_cost_column if total_cost_column is None else None,
+        )
+        if "Sales" in totals:
+            add_overview("Sales performance", "Total revenue", format_numeric_value(totals["Sales"], "Revenue"))
+        if "Profit" in totals:
+            add_overview("Sales performance", "Total profit", format_numeric_value(totals["Profit"], "Profit"))
+        if "Units Sold" in totals:
+            add_overview("Sales performance", "Total units sold", f"{totals['Units Sold']:,.0f}")
+        if order_column:
+            add_overview("Sales performance", "Distinct orders", f"{dataset[order_column].nunique():,}")
+            if "Sales" in totals and dataset[order_column].nunique():
+                average_order_value = totals["Sales"] / dataset[order_column].nunique()
+                add_overview("Sales performance", "Average order value", format_numeric_value(average_order_value, "Revenue"))
+        if product_column and not product_summary.empty:
+            ranking_metric = next(
+                (metric for metric in ("Profit", "Sales", "Units Sold") if metric in product_summary),
+                "Units Sold",
+            )
+            top_products = product_summary.nlargest(5, ranking_metric)
+            add_overview("Product performance", f"Top products by {ranking_metric.lower()}", "; ".join(
+                f"{row['Product']} ({format_numeric_value(row[ranking_metric], ranking_metric)})"
+                for _, row in top_products.iterrows()
+            ))
+            worst_product = product_summary.nsmallest(1, ranking_metric).iloc[0]
+            add_overview(
+                "Product performance",
+                f"Least performing product by {ranking_metric.lower()}",
+                f"{worst_product['Product']} ({format_numeric_value(worst_product[ranking_metric], ranking_metric)})",
+            )
+            if ranking_metric != "Units Sold":
+                top_seller = product_summary.nlargest(1, "Units Sold").iloc[0]
+                add_overview(
+                    "Product performance",
+                    "Most units sold",
+                    f"{top_seller['Product']} ({top_seller['Units Sold']:,.0f} units)",
+                )
+
+    return pd.DataFrame(overview_rows)
 
 def infer_visualization(prompt, result_df, requested_type):
     """Choose a useful chart when the model returns a table for chartable results."""
@@ -384,6 +575,19 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Analyzing data..."):
+            if is_executive_overview_request(prompt):
+                try:
+                    overview_df = build_dataset_overview(parquet_path, profile)
+                    message = format_executive_overview_message(overview_df)
+                    st.markdown(message)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": message,
+                    })
+                except Exception as overview_error:
+                    st.error(f"Could not build the executive overview: {overview_error}")
+                st.stop()
+
             try:
                 response = client.chat.completions.create(
                     model="openai/gpt-oss-20b",
@@ -401,10 +605,10 @@ if prompt:
                 else:
                     st.error(f"Connection Error: {err_msg}")
                 st.stop()
-                
+
             try:
                 ai_payload = extract_json(response.choices[0].message.content.strip())
-                
+
                 sql_query = ai_payload.get("sql")
                 viz_type = ai_payload.get("type", "text")
                 x_col = ai_payload.get("x")
@@ -430,7 +634,7 @@ if prompt:
                     system_prompt,
                     conversation_messages,
                 )
-                
+
                 if retry_payload and isinstance(retry_payload, dict):
                     viz_type = retry_payload.get("type", viz_type)
                     x_col = retry_payload.get("x", x_col)
@@ -455,7 +659,11 @@ if prompt:
                     result_df = name_numeric_months(result_df)
                     viz_type = infer_visualization(prompt, result_df, viz_type)
 
-                    if re.search(r"\b(executive summary|summari[sz]e|key insights|anomal(?:y|ies)|overview|brief)\b", prompt, re.IGNORECASE):
+                    if re.search(
+                        r"\b(executive summary|summari[sz]e|key insights|anomal(?:y|ies)|brief)\b",
+                        prompt,
+                        re.IGNORECASE,
+                    ):
                         try:
                             message = summarize_query_results(client, prompt, result_df)
                         except Exception:

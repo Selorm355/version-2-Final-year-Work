@@ -1,6 +1,11 @@
 # Python Virtual Environment
 venv/
+.venv/
+.venv-1/
 env/
+
+# Local environment secrets
+.env
 
 # OmniPulse Analytics Local Storage
 temp_data/
