@@ -5,6 +5,13 @@
   },
   "colleague": {
     "name": "Colleague",
-    "password_hash": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+    "password_hash": "pbkdf2_sha256$0756b1a6e157e52c9124ee744c4f4092$65e1313e81f678491f0e54738d3ad84ce3d78edcb0aaba77681494d7b1286313"
+  },
+  "mctech@gmail.com": {
+    "name": "mctech",
+    "company_name": "mctech",
+    "email": "mctech@gmail.com",
+    "industry_type": "retail",
+    "password_hash": "pbkdf2_sha256$5b34ef7f4339ea166a9ab16f87609d5d$3641b8016604c4ca1cb1446877e74f16769d9231e068642531d172163ed989ff"
   }
 }

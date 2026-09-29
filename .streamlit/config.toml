@@ -1,0 +1,10 @@
+[server]
+runOnSave = true
+fileWatcherType = "auto"
+
+[theme]
+primaryColor = "#008080"
+backgroundColor = "#F0F8FF"
+secondaryBackgroundColor = "#E0E0E0"
+textColor = "#2F4F4F"
+font = "sans serif"

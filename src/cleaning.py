@@ -107,6 +107,7 @@ def profile_dataframe(df):
             dimensions.append(col)
             
     profile_dict = {
+        "Columns": list(df.columns),
         "Metrics": metrics,
         "Dimensions": dimensions
     }
